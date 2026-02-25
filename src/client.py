@@ -16,12 +16,14 @@ Pricing (per hour of audio):
 import json
 import logging
 import os
+import random
 import subprocess
 import tempfile
+import time
 from dataclasses import dataclass
 from pathlib import Path
 
-from openai import OpenAI
+from openai import APIError, APITimeoutError, RateLimitError, OpenAI
 
 logger = logging.getLogger(__name__)
 
@@ -87,7 +89,7 @@ class WhisperClient:
                 f"Set {config['env_key']} environment variable or pass api_key parameter."
             )
 
-        client_kwargs = {"api_key": api_key}
+        client_kwargs = {"api_key": api_key, "timeout": 120.0}
         if config["base_url"]:
             client_kwargs["base_url"] = config["base_url"]
 
@@ -98,12 +100,14 @@ class WhisperClient:
         self,
         video_path: str,
         model: str | None = None,
+        max_retries: int = 3,
     ) -> TranscriptionResult:
         """Transcribe video and return word-level timestamps.
 
         Args:
             video_path: Path to video file
             model: Whisper model to use (default: provider-specific)
+            max_retries: Max retry attempts for transient API failures
 
         Returns:
             TranscriptionResult with text, word timestamps, and duration
@@ -111,26 +115,64 @@ class WhisperClient:
         model = model or self.default_model
         audio_path = self._extract_audio(video_path)
         try:
-            with open(audio_path, "rb") as audio_file:
-                response = self.client.audio.transcriptions.create(
-                    model=model,
-                    file=audio_file,
-                    response_format="verbose_json",
-                    timestamp_granularities=["word"],
-                )
-
-            words = [
-                {"word": w.word, "start": w.start, "end": w.end}
-                for w in (response.words or [])
-            ]
-
-            return TranscriptionResult(
-                text=response.text,
-                words=words,
-                duration=response.duration or 0.0,
-            )
+            return self._transcribe_with_retry(audio_path, model, max_retries)
         finally:
             os.unlink(audio_path)
+
+    def _transcribe_with_retry(
+        self,
+        audio_path: str,
+        model: str,
+        max_retries: int,
+    ) -> TranscriptionResult:
+        """Call Whisper API with exponential backoff on transient failures."""
+        last_error = None
+
+        for attempt in range(max_retries + 1):
+            try:
+                with open(audio_path, "rb") as audio_file:
+                    response = self.client.audio.transcriptions.create(
+                        model=model,
+                        file=audio_file,
+                        response_format="verbose_json",
+                        timestamp_granularities=["word"],
+                    )
+
+                words = [
+                    {"word": w.word, "start": w.start, "end": w.end}
+                    for w in (response.words or [])
+                ]
+
+                return TranscriptionResult(
+                    text=response.text,
+                    words=words,
+                    duration=response.duration or 0.0,
+                )
+
+            except (RateLimitError, APITimeoutError) as e:
+                last_error = e
+                if attempt < max_retries:
+                    delay = _backoff_delay(attempt, e)
+                    logger.warning(
+                        "Retryable error (attempt %d/%d): %s. Retrying in %.1fs",
+                        attempt + 1, max_retries, type(e).__name__, delay,
+                    )
+                    time.sleep(delay)
+
+            except APIError as e:
+                if e.status_code and e.status_code >= 500:
+                    last_error = e
+                    if attempt < max_retries:
+                        delay = _backoff_delay(attempt, e)
+                        logger.warning(
+                            "Server error %d (attempt %d/%d). Retrying in %.1fs",
+                            e.status_code, attempt + 1, max_retries, delay,
+                        )
+                        time.sleep(delay)
+                    continue
+                raise  # 4xx (except 429) are not retryable
+
+        raise last_error  # type: ignore[misc]
 
     def _extract_audio(self, video_path: str) -> str:
         """Extract audio from video as MP3.
@@ -173,6 +215,26 @@ class WhisperClient:
             f"Audio file exceeds 25MB even at 64kbps. "
             f"Video may be too long for direct transcription."
         )
+
+
+def _backoff_delay(attempt: int, error: Exception | None = None) -> float:
+    """Calculate exponential backoff delay with jitter.
+
+    Respects Retry-After header if present on RateLimitError.
+    """
+    if isinstance(error, RateLimitError) and hasattr(error, 'response'):
+        retry_after = None
+        if error.response is not None:
+            retry_after = error.response.headers.get("retry-after")
+        if retry_after:
+            try:
+                return float(retry_after)
+            except (ValueError, TypeError):
+                pass
+
+    base_delay = 2 ** attempt  # 1s, 2s, 4s
+    jitter = random.uniform(0, base_delay * 0.5)
+    return base_delay + jitter
 
 
 def load_cached_transcription(cache_path: str) -> list[dict] | None:
