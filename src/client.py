@@ -1,14 +1,16 @@
 """
-Whisper transcription client using Groq API (OpenAI-compatible).
+Whisper transcription client with configurable provider (OpenAI or Groq).
 
 Provides word-level timestamps for subtitle generation and word-boundary snapping.
-Uses Groq's hosted Whisper models via the OpenAI SDK.
+Supports OpenAI Whisper (default) and Groq-hosted Whisper via the OpenAI SDK.
 
 Pricing (per hour of audio):
-  - whisper-large-v3-turbo: $0.04  (default, recommended)
-  - whisper-large-v3:       $0.111
-  - distil-whisper:         $0.02  (cheapest, lower quality)
-  - OpenAI Whisper:         $0.36  (9x more expensive)
+  OpenAI:
+  - whisper-1:                $0.36
+  Groq:
+  - whisper-large-v3-turbo:   $0.04  (cheapest)
+  - whisper-large-v3:         $0.111
+  - distil-whisper-large-v3-en: $0.02
 """
 
 import json
@@ -23,7 +25,20 @@ from openai import OpenAI
 
 logger = logging.getLogger(__name__)
 
-MAX_AUDIO_SIZE_BYTES = 25 * 1024 * 1024  # 25MB Groq limit
+MAX_AUDIO_SIZE_BYTES = 25 * 1024 * 1024  # 25MB limit (both OpenAI and Groq)
+
+PROVIDER_CONFIG = {
+    "openai": {
+        "env_key": "OPENAI_API_KEY",
+        "base_url": None,  # Use OpenAI default
+        "default_model": "whisper-1",
+    },
+    "groq": {
+        "env_key": "GROQ_API_KEY",
+        "base_url": "https://api.groq.com/openai/v1",
+        "default_model": "whisper-large-v3-turbo",
+    },
+}
 
 
 @dataclass
@@ -34,35 +49,66 @@ class TranscriptionResult:
     duration: float
 
 
-class WhisperClient:
-    """Groq-hosted Whisper transcription via OpenAI-compatible API"""
+def detect_provider() -> str:
+    """Auto-detect provider from available environment variables.
 
-    def __init__(self, api_key: str | None = None):
-        api_key = api_key or os.environ.get("GROQ_API_KEY")
-        if not api_key:
+    Priority: OPENAI_API_KEY > GROQ_API_KEY.
+    Explicit WHISPER_PROVIDER env var overrides auto-detection.
+    """
+    explicit = os.environ.get("WHISPER_PROVIDER", "").lower()
+    if explicit in PROVIDER_CONFIG:
+        return explicit
+
+    if os.environ.get("OPENAI_API_KEY"):
+        return "openai"
+    if os.environ.get("GROQ_API_KEY"):
+        return "groq"
+
+    return "openai"  # Default, will fail with clear error if no key
+
+
+class WhisperClient:
+    """Whisper transcription via OpenAI or Groq API"""
+
+    def __init__(self, api_key: str | None = None, provider: str | None = None):
+        self.provider = provider or detect_provider()
+
+        if self.provider not in PROVIDER_CONFIG:
             raise ValueError(
-                "GROQ_API_KEY not found. Set GROQ_API_KEY environment variable or pass api_key parameter."
+                f"Unknown provider: {self.provider}. Use 'openai' or 'groq'."
             )
 
-        self.client = OpenAI(
-            api_key=api_key,
-            base_url="https://api.groq.com/openai/v1",
-        )
+        config = PROVIDER_CONFIG[self.provider]
+        api_key = api_key or os.environ.get(config["env_key"])
+
+        if not api_key:
+            raise ValueError(
+                f"{config['env_key']} not found. "
+                f"Set {config['env_key']} environment variable or pass api_key parameter."
+            )
+
+        client_kwargs = {"api_key": api_key}
+        if config["base_url"]:
+            client_kwargs["base_url"] = config["base_url"]
+
+        self.client = OpenAI(**client_kwargs)
+        self.default_model = config["default_model"]
 
     def transcribe_video(
         self,
         video_path: str,
-        model: str = "whisper-large-v3-turbo",
+        model: str | None = None,
     ) -> TranscriptionResult:
         """Transcribe video and return word-level timestamps.
 
         Args:
             video_path: Path to video file
-            model: Whisper model to use (default: whisper-large-v3-turbo)
+            model: Whisper model to use (default: provider-specific)
 
         Returns:
             TranscriptionResult with text, word timestamps, and duration
         """
+        model = model or self.default_model
         audio_path = self._extract_audio(video_path)
         try:
             with open(audio_path, "rb") as audio_file:

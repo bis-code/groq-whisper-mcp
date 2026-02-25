@@ -1,4 +1,4 @@
-"""Tests for Whisper transcription client (Groq API via OpenAI SDK)"""
+"""Tests for Whisper transcription client (OpenAI/Groq via OpenAI SDK)"""
 
 import json
 import os
@@ -8,7 +8,45 @@ from unittest.mock import MagicMock, patch, mock_open
 
 import pytest
 
-from client import WhisperClient, TranscriptionResult, load_cached_transcription, save_transcription_cache
+from client import WhisperClient, TranscriptionResult, load_cached_transcription, save_transcription_cache, detect_provider
+
+
+# ============================================================
+# Provider Detection
+# ============================================================
+
+
+class TestDetectProvider:
+    """Tests for provider auto-detection from environment"""
+
+    @patch.dict(os.environ, {"OPENAI_API_KEY": "sk-123"}, clear=True)
+    def test_openai_key_selects_openai(self):
+        assert detect_provider() == "openai"
+
+    @patch.dict(os.environ, {"GROQ_API_KEY": "gsk-123"}, clear=True)
+    def test_groq_key_selects_groq(self):
+        assert detect_provider() == "groq"
+
+    @patch.dict(os.environ, {"OPENAI_API_KEY": "sk-123", "GROQ_API_KEY": "gsk-123"}, clear=True)
+    def test_both_keys_prefers_openai(self):
+        assert detect_provider() == "openai"
+
+    @patch.dict(os.environ, {"WHISPER_PROVIDER": "groq", "OPENAI_API_KEY": "sk-123"}, clear=True)
+    def test_explicit_provider_overrides_autodetect(self):
+        assert detect_provider() == "groq"
+
+    @patch.dict(os.environ, {"WHISPER_PROVIDER": "openai", "GROQ_API_KEY": "gsk-123"}, clear=True)
+    def test_explicit_openai_with_groq_key(self):
+        assert detect_provider() == "openai"
+
+    @patch.dict(os.environ, {}, clear=True)
+    def test_no_keys_defaults_to_openai(self):
+        assert detect_provider() == "openai"
+
+    @patch.dict(os.environ, {"WHISPER_PROVIDER": "invalid"}, clear=True)
+    def test_invalid_provider_falls_through_to_autodetect(self):
+        """Invalid explicit provider is ignored, falls to auto-detect"""
+        assert detect_provider() == "openai"
 
 
 # ============================================================
@@ -20,28 +58,56 @@ class TestWhisperClientInit:
     """Tests for WhisperClient initialization"""
 
     @patch("client.OpenAI")
-    def test_init_with_explicit_key(self, mock_openai_cls):
-        client = WhisperClient(api_key="test-key-123")
+    def test_init_with_explicit_key_openai(self, mock_openai_cls):
+        client = WhisperClient(api_key="test-key-123", provider="openai")
+        mock_openai_cls.assert_called_once_with(api_key="test-key-123")
+        assert client.provider == "openai"
+        assert client.default_model == "whisper-1"
+
+    @patch("client.OpenAI")
+    def test_init_with_explicit_key_groq(self, mock_openai_cls):
+        client = WhisperClient(api_key="test-key-123", provider="groq")
         mock_openai_cls.assert_called_once_with(
             api_key="test-key-123",
             base_url="https://api.groq.com/openai/v1",
         )
+        assert client.provider == "groq"
+        assert client.default_model == "whisper-large-v3-turbo"
 
-    @patch.dict(os.environ, {"GROQ_API_KEY": "env-key-456"})
+    @patch.dict(os.environ, {"OPENAI_API_KEY": "env-key-456"}, clear=True)
     @patch("client.OpenAI")
-    def test_init_from_env(self, mock_openai_cls):
+    def test_init_from_env_openai(self, mock_openai_cls):
+        client = WhisperClient()
+        mock_openai_cls.assert_called_once_with(api_key="env-key-456")
+        assert client.provider == "openai"
+
+    @patch.dict(os.environ, {"GROQ_API_KEY": "env-key-789"}, clear=True)
+    @patch("client.OpenAI")
+    def test_init_from_env_groq(self, mock_openai_cls):
         client = WhisperClient()
         mock_openai_cls.assert_called_once_with(
-            api_key="env-key-456",
+            api_key="env-key-789",
             base_url="https://api.groq.com/openai/v1",
         )
+        assert client.provider == "groq"
 
     @patch.dict(os.environ, {}, clear=True)
     @patch("client.OpenAI")
     def test_init_no_key_raises(self, mock_openai_cls):
-        os.environ.pop("GROQ_API_KEY", None)
-        with pytest.raises(ValueError, match="GROQ_API_KEY"):
+        with pytest.raises(ValueError, match="OPENAI_API_KEY"):
             WhisperClient()
+
+    @patch.dict(os.environ, {"GROQ_API_KEY": "gsk-123", "WHISPER_PROVIDER": "openai"}, clear=True)
+    @patch("client.OpenAI")
+    def test_init_explicit_openai_but_only_groq_key_raises(self, mock_openai_cls):
+        """Explicit openai provider with only GROQ_API_KEY should fail"""
+        with pytest.raises(ValueError, match="OPENAI_API_KEY"):
+            WhisperClient()
+
+    @patch("client.OpenAI")
+    def test_init_unknown_provider_raises(self, mock_openai_cls):
+        with pytest.raises(ValueError, match="Unknown provider"):
+            WhisperClient(api_key="test", provider="deepgram")
 
 
 # ============================================================
@@ -57,7 +123,7 @@ class TestAudioExtraction:
     def test_extract_128kbps_under_limit(self, mock_run, mock_openai_cls):
         """128kbps MP3 under 25MB passes through"""
         mock_run.return_value = MagicMock(returncode=0)
-        client = WhisperClient(api_key="test")
+        client = WhisperClient(api_key="test", provider="openai")
 
         with patch("client.os.path.getsize", return_value=10 * 1024 * 1024):  # 10MB
             result = client._extract_audio("/fake/video.mp4")
@@ -74,7 +140,7 @@ class TestAudioExtraction:
     def test_extract_fallback_64kbps(self, mock_run, mock_openai_cls):
         """Falls back to 64kbps when 128kbps exceeds 25MB"""
         mock_run.return_value = MagicMock(returncode=0)
-        client = WhisperClient(api_key="test")
+        client = WhisperClient(api_key="test", provider="openai")
 
         call_count = 0
 
@@ -100,7 +166,7 @@ class TestAudioExtraction:
     def test_extract_too_large_even_at_64k(self, mock_run, mock_openai_cls):
         """Raises when even 64kbps exceeds 25MB"""
         mock_run.return_value = MagicMock(returncode=0)
-        client = WhisperClient(api_key="test")
+        client = WhisperClient(api_key="test", provider="openai")
 
         with patch("client.os.path.getsize", return_value=30 * 1024 * 1024), \
              patch("client.os.unlink"):
@@ -115,7 +181,7 @@ class TestAudioExtraction:
             returncode=1,
             stderr=b"ffmpeg error: codec not found",
         )
-        client = WhisperClient(api_key="test")
+        client = WhisperClient(api_key="test", provider="openai")
 
         with pytest.raises(RuntimeError, match="ffmpeg"):
             client._extract_audio("/fake/video.mp4")
@@ -151,7 +217,7 @@ class TestTranscription:
         mock_response.duration = 1.0
         mock_client.audio.transcriptions.create.return_value = mock_response
 
-        client = WhisperClient(api_key="test")
+        client = WhisperClient(api_key="test", provider="openai")
 
         with patch.object(client, "_extract_audio", return_value="/tmp/audio.mp3"):
             with patch("builtins.open", mock_open(read_data=b"audio")):
@@ -166,8 +232,8 @@ class TestTranscription:
         assert result.duration == 1.0
 
     @patch("client.OpenAI")
-    def test_transcribe_uses_correct_model(self, mock_openai_cls):
-        """Transcription uses whisper-large-v3-turbo by default"""
+    def test_transcribe_uses_provider_default_model(self, mock_openai_cls):
+        """Transcription uses provider-specific default model"""
         mock_client = MagicMock()
         mock_openai_cls.return_value = mock_client
 
@@ -177,7 +243,29 @@ class TestTranscription:
         mock_response.duration = 1.0
         mock_client.audio.transcriptions.create.return_value = mock_response
 
-        client = WhisperClient(api_key="test")
+        client = WhisperClient(api_key="test", provider="openai")
+
+        with patch.object(client, "_extract_audio", return_value="/tmp/audio.mp3"):
+            with patch("builtins.open", mock_open(read_data=b"audio")):
+                with patch("client.os.unlink"):
+                    client.transcribe_video("/fake/video.mp4")
+
+        call_kwargs = mock_client.audio.transcriptions.create.call_args
+        assert call_kwargs.kwargs.get("model") == "whisper-1"
+
+    @patch("client.OpenAI")
+    def test_transcribe_groq_default_model(self, mock_openai_cls):
+        """Groq provider uses whisper-large-v3-turbo by default"""
+        mock_client = MagicMock()
+        mock_openai_cls.return_value = mock_client
+
+        mock_response = MagicMock()
+        mock_response.text = "test"
+        mock_response.words = []
+        mock_response.duration = 1.0
+        mock_client.audio.transcriptions.create.return_value = mock_response
+
+        client = WhisperClient(api_key="test", provider="groq")
 
         with patch.object(client, "_extract_audio", return_value="/tmp/audio.mp3"):
             with patch("builtins.open", mock_open(read_data=b"audio")):
@@ -199,7 +287,7 @@ class TestTranscription:
         mock_response.duration = 1.0
         mock_client.audio.transcriptions.create.return_value = mock_response
 
-        client = WhisperClient(api_key="test")
+        client = WhisperClient(api_key="test", provider="openai")
 
         with patch.object(client, "_extract_audio", return_value="/tmp/audio.mp3"):
             with patch("builtins.open", mock_open(read_data=b"audio")):
@@ -221,7 +309,7 @@ class TestTranscription:
         mock_response.duration = 1.0
         mock_client.audio.transcriptions.create.return_value = mock_response
 
-        client = WhisperClient(api_key="test")
+        client = WhisperClient(api_key="test", provider="openai")
 
         with patch.object(client, "_extract_audio", return_value="/tmp/audio_temp.mp3"):
             with patch("builtins.open", mock_open(read_data=b"audio")):
@@ -237,7 +325,7 @@ class TestTranscription:
         mock_openai_cls.return_value = mock_client
         mock_client.audio.transcriptions.create.side_effect = Exception("API error")
 
-        client = WhisperClient(api_key="test")
+        client = WhisperClient(api_key="test", provider="openai")
 
         with patch.object(client, "_extract_audio", return_value="/tmp/audio_temp.mp3"):
             with patch("builtins.open", mock_open(read_data=b"audio")):

@@ -1,7 +1,7 @@
 [project]
-name = "groq-whisper-mcp"
-version = "0.1.0"
-description = "MCP server for audio/video transcription via Groq-hosted Whisper with word-level timestamps"
+name = "whisper-mcp"
+version = "0.2.0"
+description = "MCP server for audio/video transcription via Whisper with word-level timestamps (OpenAI or Groq)"
 requires-python = ">=3.10"
 dependencies = [
     "mcp>=1.0.0",

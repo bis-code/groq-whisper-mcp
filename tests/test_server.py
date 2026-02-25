@@ -1,4 +1,4 @@
-"""Tests for Groq Whisper MCP server tool handlers"""
+"""Tests for Whisper MCP server tool handlers"""
 
 import json
 import os
@@ -86,7 +86,10 @@ class TestTranscribeVideoTool:
         mock_result.duration = 1.0
 
         with patch("server.WhisperClient") as mock_cls:
-            mock_cls.return_value.transcribe_video.return_value = mock_result
+            mock_instance = mock_cls.return_value
+            mock_instance.transcribe_video.return_value = mock_result
+            mock_instance.provider = "openai"
+            mock_instance.default_model = "whisper-1"
             result = await call_tool("transcribe_video", {
                 "video_path": str(video),
                 "force_retranscribe": True,
@@ -95,6 +98,7 @@ class TestTranscribeVideoTool:
         data = json.loads(result[0].text)
         assert data["source"] == "whisper_api"
         assert data["text"] == "new transcription"
+        assert data["provider"] == "openai"
 
     @pytest.mark.asyncio
     async def test_api_error(self, tmp_path):
@@ -103,11 +107,11 @@ class TestTranscribeVideoTool:
         video.write_bytes(b"fake")
 
         with patch("server.WhisperClient") as mock_cls:
-            mock_cls.return_value.transcribe_video.side_effect = RuntimeError("Groq API timeout")
+            mock_cls.return_value.transcribe_video.side_effect = RuntimeError("API timeout")
             result = await call_tool("transcribe_video", {"video_path": str(video)})
 
         assert "Transcription failed" in result[0].text
-        assert "Groq API timeout" in result[0].text
+        assert "API timeout" in result[0].text
 
 
 # ============================================================
@@ -125,8 +129,9 @@ class TestEstimateCostTool:
         assert "not found" in result[0].text
 
     @pytest.mark.asyncio
-    async def test_cost_calculation(self, tmp_path):
-        """Calculates correct cost for known duration"""
+    @patch.dict(os.environ, {"OPENAI_API_KEY": "sk-test"}, clear=True)
+    async def test_cost_calculation_openai(self, tmp_path):
+        """Calculates correct cost for OpenAI whisper-1"""
         video = tmp_path / "video.mp4"
         video.write_bytes(b"fake")
 
@@ -137,11 +142,31 @@ class TestEstimateCostTool:
         data = json.loads(result[0].text)
         assert data["duration_seconds"] == 600.0
         assert data["duration_minutes"] == 10.0
-        # 10 min = 1/6 hr * $0.04/hr = $0.0067
+        assert data["provider"] == "openai"
+        assert data["model"] == "whisper-1"
+        assert data["rate_per_hour"] == 0.36
+        # 10 min = 1/6 hr * $0.36/hr = $0.06
+        assert data["estimated_cost_usd"] == round((600 / 3600) * 0.36, 4)
+        # Comparison includes all models
+        assert "whisper-1" in data["comparison"]
+        assert "whisper-large-v3-turbo" in data["comparison"]
+
+    @pytest.mark.asyncio
+    @patch.dict(os.environ, {"GROQ_API_KEY": "gsk-test"}, clear=True)
+    async def test_cost_calculation_groq(self, tmp_path):
+        """Calculates correct cost for Groq default model"""
+        video = tmp_path / "video.mp4"
+        video.write_bytes(b"fake")
+
+        with patch("server.subprocess") as mock_sp:
+            mock_sp.run.return_value = MagicMock(stdout="600.0\n", returncode=0)
+            result = await call_tool("estimate_transcription_cost", {"video_path": str(video)})
+
+        data = json.loads(result[0].text)
+        assert data["provider"] == "groq"
+        assert data["model"] == "whisper-large-v3-turbo"
         assert data["rate_per_hour"] == 0.04
         assert data["estimated_cost_usd"] == round((600 / 3600) * 0.04, 4)
-        # OpenAI comparison
-        assert "openai_whisper_cost" in data["comparison"]
 
 
 # ============================================================

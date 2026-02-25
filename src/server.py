@@ -1,19 +1,24 @@
 #!/usr/bin/env python3
 """
-Groq Whisper MCP Server — transcription with word-level timestamps.
+Whisper MCP Server — transcription with word-level timestamps.
 
-Uses Groq-hosted Whisper models via the OpenAI SDK.
-Cost: $0.04/hr (whisper-large-v3-turbo) vs $0.36/hr (OpenAI) = 9x cheaper.
+Supports OpenAI Whisper (default) and Groq-hosted Whisper via the OpenAI SDK.
+Provider is auto-detected from environment variables.
 
 Configure in Claude Code .mcp.json:
 {
     "whisper": {
         "command": "path/to/venv/bin/python",
-        "args": ["-m", "src.server"],
-        "cwd": "path/to/groq-whisper-mcp",
-        "env": { "GROQ_API_KEY": "your-key-here" }
+        "args": ["-m", "server"],
+        "cwd": "path/to/whisper-mcp/src",
+        "env": { "OPENAI_API_KEY": "your-key-here" }
     }
 }
+
+Optional env vars:
+  WHISPER_PROVIDER: "openai" (default) or "groq" — override auto-detection
+  OPENAI_API_KEY: Required for OpenAI provider
+  GROQ_API_KEY: Required for Groq provider
 """
 
 import json
@@ -25,9 +30,19 @@ from mcp.server import Server
 from mcp.server.stdio import stdio_server
 from mcp.types import Tool, TextContent
 
-from client import WhisperClient, load_cached_transcription, save_transcription_cache
+from client import WhisperClient, load_cached_transcription, save_transcription_cache, detect_provider, PROVIDER_CONFIG
 
-server = Server("groq-whisper")
+server = Server("whisper")
+
+# Pricing rates per hour of audio, by model
+RATES = {
+    # OpenAI
+    "whisper-1": 0.36,
+    # Groq
+    "whisper-large-v3-turbo": 0.04,
+    "whisper-large-v3": 0.111,
+    "distil-whisper-large-v3-en": 0.02,
+}
 
 
 def _get_cache_path(video_path: str) -> str:
@@ -47,15 +62,18 @@ def _get_cache_path(video_path: str) -> str:
 
 @server.list_tools()
 async def list_tools():
+    provider = detect_provider()
+    default_model = PROVIDER_CONFIG[provider]["default_model"]
+
     return [
         Tool(
             name="transcribe_video",
-            description="""Transcribe a video using Whisper via Groq API. Returns word-level timestamps.
+            description=f"""Transcribe a video using Whisper API. Returns word-level timestamps.
 
-Uses Groq's hosted Whisper models for fast, accurate transcription with per-word timing.
-Cost: ~$0.04/hour (whisper-large-v3-turbo). Results cached per-project.
+Currently using: {provider} provider (model: {default_model}).
+Set WHISPER_PROVIDER env var to switch between 'openai' and 'groq'.
 
-Returns: Full text, word-level timestamps [{word, start, end}], and duration.""",
+Returns: Full text, word-level timestamps [{{word, start, end}}], and duration.""",
             inputSchema={
                 "type": "object",
                 "properties": {
@@ -65,8 +83,8 @@ Returns: Full text, word-level timestamps [{word, start, end}], and duration."""
                     },
                     "model": {
                         "type": "string",
-                        "description": "Whisper model to use (default: whisper-large-v3-turbo)",
-                        "default": "whisper-large-v3-turbo"
+                        "description": f"Whisper model to use (default: {default_model})",
+                        "default": default_model
                     },
                     "force_retranscribe": {
                         "type": "boolean",
@@ -82,8 +100,7 @@ Returns: Full text, word-level timestamps [{word, start, end}], and duration."""
             description="""Estimate the cost of transcribing a video file.
 
 Returns estimated cost based on video duration and selected model.
-Models: whisper-large-v3-turbo ($0.04/hr), whisper-large-v3 ($0.111/hr), distil-whisper ($0.02/hr).
-Includes comparison with OpenAI Whisper pricing ($0.36/hr).""",
+Includes comparison across providers.""",
             inputSchema={
                 "type": "object",
                 "properties": {
@@ -93,8 +110,7 @@ Includes comparison with OpenAI Whisper pricing ($0.36/hr).""",
                     },
                     "model": {
                         "type": "string",
-                        "description": "Whisper model (default: whisper-large-v3-turbo)",
-                        "default": "whisper-large-v3-turbo"
+                        "description": "Whisper model (default: provider-specific)"
                     }
                 },
                 "required": ["video_path"]
@@ -107,7 +123,7 @@ Includes comparison with OpenAI Whisper pricing ($0.36/hr).""",
 async def call_tool(name: str, arguments: dict):
     if name == "transcribe_video":
         video_path = os.path.abspath(arguments["video_path"])
-        model = arguments.get("model", "whisper-large-v3-turbo")
+        model = arguments.get("model")
         force = arguments.get("force_retranscribe", False)
 
         if not os.path.exists(video_path):
@@ -135,7 +151,8 @@ async def call_tool(name: str, arguments: dict):
             return [TextContent(type="text", text=json.dumps({
                 "video_path": video_path,
                 "source": "whisper_api",
-                "model": model,
+                "provider": client.provider,
+                "model": model or client.default_model,
                 "cache_path": cache_path,
                 "text": result.text,
                 "duration": result.duration,
@@ -148,10 +165,14 @@ async def call_tool(name: str, arguments: dict):
 
     elif name == "estimate_transcription_cost":
         video_path = os.path.abspath(arguments["video_path"])
-        model = arguments.get("model", "whisper-large-v3-turbo")
 
         if not os.path.exists(video_path):
             return [TextContent(type="text", text=f"Error: Video not found: {video_path}")]
+
+        # Detect current provider for default model
+        provider = detect_provider()
+        default_model = PROVIDER_CONFIG[provider]["default_model"]
+        model = arguments.get("model") or default_model
 
         # Get video duration via ffprobe
         try:
@@ -164,27 +185,28 @@ async def call_tool(name: str, arguments: dict):
         except Exception:
             return [TextContent(type="text", text="Error: Could not determine video duration")]
 
-        rates = {
-            "whisper-large-v3-turbo": 0.04,
-            "whisper-large-v3": 0.111,
-            "distil-whisper-large-v3-en": 0.02,
-        }
-        rate = rates.get(model, 0.04)
+        rate = RATES.get(model, RATES.get(default_model, 0.36))
         duration_hours = duration_seconds / 3600
         cost = duration_hours * rate
-        openai_cost = (duration_seconds / 60) * 0.006
+
+        # Compare across providers
+        comparison = {}
+        for compare_model, compare_rate in RATES.items():
+            compare_cost = duration_hours * compare_rate
+            comparison[compare_model] = {
+                "rate_per_hour": compare_rate,
+                "estimated_cost": round(compare_cost, 4),
+            }
 
         return [TextContent(type="text", text=json.dumps({
             "video_path": video_path,
+            "provider": provider,
             "model": model,
             "duration_seconds": round(duration_seconds, 1),
             "duration_minutes": round(duration_seconds / 60, 1),
             "rate_per_hour": rate,
             "estimated_cost_usd": round(cost, 4),
-            "comparison": {
-                "openai_whisper_cost": round(openai_cost, 4),
-                "groq_savings_vs_openai": f"{round((1 - cost / openai_cost) * 100)}%" if openai_cost > 0 else "N/A"
-            }
+            "comparison": comparison,
         }, indent=2))]
 
     return [TextContent(type="text", text=f"Unknown tool: {name}")]
