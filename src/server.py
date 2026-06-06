@@ -23,14 +23,32 @@ Optional env vars:
 
 import json
 import os
+import re
 import subprocess
 from pathlib import Path
 
 from mcp.server import Server
 from mcp.server.stdio import stdio_server
 from mcp.types import Tool, TextContent
+from youtube_transcript_api import YouTubeTranscriptApi
 
 from client import WhisperClient, load_cached_transcription, save_transcription_cache, detect_provider, PROVIDER_CONFIG
+
+
+_YOUTUBE_ID_PATTERNS = (
+    re.compile(r"^(?P<id>[A-Za-z0-9_-]{11})$"),
+    re.compile(r"youtu\.be/(?P<id>[A-Za-z0-9_-]{11})"),
+    re.compile(r"youtube\.com/watch\?v=(?P<id>[A-Za-z0-9_-]{11})"),
+    re.compile(r"youtube\.com/(?:embed|shorts)/(?P<id>[A-Za-z0-9_-]{11})"),
+)
+
+
+def _extract_youtube_id(value: str) -> str | None:
+    for pattern in _YOUTUBE_ID_PATTERNS:
+        m = pattern.search(value)
+        if m:
+            return m.group("id")
+    return None
 
 server = Server("whisper")
 
@@ -46,18 +64,25 @@ RATES = {
 
 
 def _get_cache_path(video_path: str) -> str:
-    """Resolve cache path for whisper word timestamps.
+    """Resolve cache path for whisper word timestamps — keyed PER-FILE by video stem.
 
-    Project structure (raw/ or edited/) -> project/edited/whisper_words.json
-    Standalone video -> sibling whisper_words.json
+    Project structure (raw/ or edited/ or final/) -> project/edited/whisper_words.<stem>.json
+    Standalone video -> sibling whisper_words.<stem>.json
+
+    The <stem> qualifier is required: multiple clips routinely live in one
+    directory (e.g. raw/<key>/clips/take-01.mp4 + take-02.mp4). A per-directory
+    cache returned the FIRST clip's words for every clip in the dir, silently
+    corrupting multi-clip transcription (and any rough-cut computed from it).
     """
-    video_parent = Path(video_path).parent
+    video_path_obj = Path(video_path)
+    stem = video_path_obj.stem
+    video_parent = video_path_obj.parent
 
     if video_parent.name in ("raw", "edited", "final"):
         project_folder = video_parent.parent
-        return str(project_folder / "edited" / "whisper_words.json")
+        return str(project_folder / "edited" / f"whisper_words.{stem}.json")
 
-    return str(video_parent / "whisper_words.json")
+    return str(video_parent / f"whisper_words.{stem}.json")
 
 
 @server.list_tools()
@@ -93,6 +118,32 @@ Returns: Full text, word-level timestamps [{{word, start, end}}], and duration."
                     }
                 },
                 "required": ["video_path"]
+            }
+        ),
+        Tool(
+            name="fetch_youtube_transcript",
+            description="""Fetch auto-generated captions for a YouTube video.
+
+Works on public, unlisted, or your own private videos via the public youtube-transcript-api
+(no Google OAuth required). Accepts a bare video ID or any standard YouTube URL.
+
+Returns: { video_id, language, source, text, segments: [{ text, start, duration }] }.
+Useful for deriving a working title from an already-uploaded clip before promoting a
+'tbd' lifecycle row.""",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "video_id_or_url": {
+                        "type": "string",
+                        "description": "YouTube video ID (e.g. 'fHx7eifXtSA') or full URL (youtu.be/<id>, youtube.com/watch?v=<id>, youtube.com/shorts/<id>)."
+                    },
+                    "language": {
+                        "type": "string",
+                        "description": "Preferred caption language code (default: 'en'). Falls back to whatever YouTube has if 'en' isn't available.",
+                        "default": "en"
+                    }
+                },
+                "required": ["video_id_or_url"]
             }
         ),
         Tool(
@@ -162,6 +213,30 @@ async def call_tool(name: str, arguments: dict):
 
         except Exception as e:
             return [TextContent(type="text", text=f"Transcription failed: {str(e)}")]
+
+    elif name == "fetch_youtube_transcript":
+        raw = arguments.get("video_id_or_url", "")
+        video_id = _extract_youtube_id(raw)
+        if video_id is None:
+            return [TextContent(type="text", text=f"Error: could not extract a YouTube video ID from {raw!r}")]
+
+        language = arguments.get("language", "en") or "en"
+        try:
+            ytt = YouTubeTranscriptApi()
+            fetched = ytt.fetch(video_id, languages=[language] if language == "en" else [language, "en"])
+            segments = fetched.to_raw_data()
+            text = " ".join(seg.get("text", "").strip() for seg in segments).strip()
+
+            return [TextContent(type="text", text=json.dumps({
+                "video_id": video_id,
+                "language": language,
+                "source": "youtube_auto_captions",
+                "text": text,
+                "segments": segments,
+                "segment_count": len(segments),
+            }, indent=2))]
+        except Exception as e:
+            return [TextContent(type="text", text=f"YouTube transcript fetch failed for {video_id!r}: {type(e).__name__}: {e}")]
 
     elif name == "estimate_transcription_cost":
         video_path = os.path.abspath(arguments["video_path"])

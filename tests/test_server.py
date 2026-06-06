@@ -18,29 +18,41 @@ class TestGetCachePath:
     """Tests for _get_cache_path project structure detection"""
 
     def test_raw_folder(self):
-        """raw/ -> project/edited/whisper_words.json"""
+        """raw/ -> project/edited/whisper_words.<stem>.json"""
         result = _get_cache_path("/videos/my-project/raw/clip.mp4")
-        assert result == "/videos/my-project/edited/whisper_words.json"
+        assert result == "/videos/my-project/edited/whisper_words.clip.json"
 
     def test_edited_folder(self):
-        """edited/ -> project/edited/whisper_words.json"""
+        """edited/ -> project/edited/whisper_words.<stem>.json"""
         result = _get_cache_path("/videos/my-project/edited/clip.mp4")
-        assert result == "/videos/my-project/edited/whisper_words.json"
+        assert result == "/videos/my-project/edited/whisper_words.clip.json"
 
     def test_final_folder(self):
-        """final/ -> project/edited/whisper_words.json"""
+        """final/ -> project/edited/whisper_words.<stem>.json"""
         result = _get_cache_path("/videos/my-project/final/output.mp4")
-        assert result == "/videos/my-project/edited/whisper_words.json"
+        assert result == "/videos/my-project/edited/whisper_words.output.json"
 
     def test_standalone_video(self):
-        """Non-project video -> sibling whisper_words.json"""
+        """Non-project video -> sibling whisper_words.<stem>.json"""
         result = _get_cache_path("/downloads/random-video.mp4")
-        assert result == "/downloads/whisper_words.json"
+        assert result == "/downloads/whisper_words.random-video.json"
 
     def test_root_video(self):
         """Video at filesystem root"""
         result = _get_cache_path("/video.mp4")
-        assert result == "/whisper_words.json"
+        assert result == "/whisper_words.video.json"
+
+    def test_multiple_clips_same_dir_get_distinct_caches(self):
+        """Regression: two clips in one dir must NOT share a cache file.
+
+        Previously the cache was keyed per-directory, so transcribing a 2nd
+        clip returned the 1st clip's words. The cache path is now per-file.
+        """
+        a = _get_cache_path("/videos/vid/raw/take-01.mp4")
+        b = _get_cache_path("/videos/vid/raw/take-02.mp4")
+        assert a != b
+        assert a == "/videos/vid/edited/whisper_words.take-01.json"
+        assert b == "/videos/vid/edited/whisper_words.take-02.json"
 
 
 # ============================================================
@@ -63,7 +75,7 @@ class TestTranscribeVideoTool:
         """Returns cached transcription when available"""
         video = tmp_path / "video.mp4"
         video.write_bytes(b"fake")
-        cache = tmp_path / "whisper_words.json"
+        cache = tmp_path / "whisper_words.video.json"
         words = [{"word": "cached", "start": 0.0, "end": 0.5}]
         cache.write_text(json.dumps(words))
 
@@ -77,7 +89,7 @@ class TestTranscribeVideoTool:
         """force_retranscribe=True bypasses cache"""
         video = tmp_path / "video.mp4"
         video.write_bytes(b"fake")
-        cache = tmp_path / "whisper_words.json"
+        cache = tmp_path / "whisper_words.video.json"
         cache.write_text(json.dumps([{"word": "old", "start": 0.0, "end": 0.5}]))
 
         mock_result = MagicMock()
@@ -181,3 +193,113 @@ class TestUnknownTool:
     async def test_unknown_tool(self):
         result = await call_tool("nonexistent_tool", {})
         assert "Unknown tool" in result[0].text
+
+
+# ============================================================
+# YouTube Auto-Captions
+# ============================================================
+
+
+from server import _extract_youtube_id
+
+
+class TestExtractYoutubeId:
+    """Tests for _extract_youtube_id"""
+
+    def test_bare_id(self):
+        assert _extract_youtube_id("fHx7eifXtSA") == "fHx7eifXtSA"
+
+    def test_short_url(self):
+        assert _extract_youtube_id("https://youtu.be/fHx7eifXtSA") == "fHx7eifXtSA"
+
+    def test_watch_url(self):
+        assert _extract_youtube_id("https://www.youtube.com/watch?v=fHx7eifXtSA") == "fHx7eifXtSA"
+
+    def test_watch_url_with_query(self):
+        assert _extract_youtube_id("https://www.youtube.com/watch?v=fHx7eifXtSA&feature=youtu.be") == "fHx7eifXtSA"
+
+    def test_shorts_url(self):
+        assert _extract_youtube_id("https://www.youtube.com/shorts/fHx7eifXtSA") == "fHx7eifXtSA"
+
+    def test_too_short(self):
+        assert _extract_youtube_id("too-short") is None
+
+    def test_empty(self):
+        assert _extract_youtube_id("") is None
+
+
+class TestFetchYoutubeTranscript:
+    """Tests for fetch_youtube_transcript tool handler"""
+
+    @pytest.mark.asyncio
+    async def test_happy_path(self):
+        fake_segments = [
+            {"text": "hello world", "start": 0.0, "duration": 1.5},
+            {"text": "second line", "start": 1.5, "duration": 2.0},
+        ]
+        fake_fetched = MagicMock()
+        fake_fetched.to_raw_data.return_value = fake_segments
+
+        fake_ytt = MagicMock()
+        fake_ytt.fetch.return_value = fake_fetched
+
+        with patch("server.YouTubeTranscriptApi", return_value=fake_ytt):
+            result = await call_tool("fetch_youtube_transcript", {
+                "video_id_or_url": "https://youtu.be/fHx7eifXtSA"
+            })
+
+        data = json.loads(result[0].text)
+        assert data["video_id"] == "fHx7eifXtSA"
+        assert data["source"] == "youtube_auto_captions"
+        assert data["language"] == "en"
+        assert data["segment_count"] == 2
+        assert data["text"] == "hello world second line"
+        assert data["segments"] == fake_segments
+
+    @pytest.mark.asyncio
+    async def test_bare_id(self):
+        fake_fetched = MagicMock()
+        fake_fetched.to_raw_data.return_value = [{"text": "x", "start": 0.0, "duration": 1.0}]
+        fake_ytt = MagicMock()
+        fake_ytt.fetch.return_value = fake_fetched
+
+        with patch("server.YouTubeTranscriptApi", return_value=fake_ytt):
+            result = await call_tool("fetch_youtube_transcript", {"video_id_or_url": "fHx7eifXtSA"})
+
+        data = json.loads(result[0].text)
+        assert data["video_id"] == "fHx7eifXtSA"
+
+    @pytest.mark.asyncio
+    async def test_invalid_id_returns_error(self):
+        result = await call_tool("fetch_youtube_transcript", {"video_id_or_url": "bad"})
+        assert "Error: could not extract" in result[0].text
+
+    @pytest.mark.asyncio
+    async def test_fetch_failure_surfaces_error(self):
+        fake_ytt = MagicMock()
+        fake_ytt.fetch.side_effect = RuntimeError("no captions available")
+
+        with patch("server.YouTubeTranscriptApi", return_value=fake_ytt):
+            result = await call_tool("fetch_youtube_transcript", {"video_id_or_url": "fHx7eifXtSA"})
+
+        assert "transcript fetch failed" in result[0].text.lower()
+        assert "RuntimeError" in result[0].text
+        assert "no captions available" in result[0].text
+
+    @pytest.mark.asyncio
+    async def test_language_param_passed_through(self):
+        fake_fetched = MagicMock()
+        fake_fetched.to_raw_data.return_value = []
+        fake_ytt = MagicMock()
+        fake_ytt.fetch.return_value = fake_fetched
+
+        with patch("server.YouTubeTranscriptApi", return_value=fake_ytt):
+            await call_tool("fetch_youtube_transcript", {
+                "video_id_or_url": "fHx7eifXtSA",
+                "language": "ro",
+            })
+
+        # languages kwarg includes user pref then en fallback.
+        call_args, call_kwargs = fake_ytt.fetch.call_args
+        assert call_args == ("fHx7eifXtSA",)
+        assert call_kwargs == {"languages": ["ro", "en"]}
