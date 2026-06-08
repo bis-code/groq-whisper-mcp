@@ -38,9 +38,20 @@ PROVIDER_CONFIG = {
     "groq": {
         "env_key": "GROQ_API_KEY",
         "base_url": "https://api.groq.com/openai/v1",
-        "default_model": "whisper-large-v3-turbo",
+        # large-v3 (not -turbo): turbo drops/garbles words in noisy audio. The
+        # quality gain matters more than turbo's speed/cost for our pipeline.
+        "default_model": "whisper-large-v3",
     },
 }
+
+# Default vocabulary-priming prompt. Whisper uses `prompt` as a style/vocab hint,
+# which sharply reduces missing/mis-heard domain jargon. Keep it short (<~200 tokens)
+# and channel-relevant; override per-call via transcribe_video(prompt=...).
+DEFAULT_PROMPT = (
+    "Developer screencast about Claude Code, MCP servers, plugins, hooks, slash "
+    "commands, rules, agents, the Anthropic SDK, Premiere Pro, and the cloud toolkit."
+)
+DEFAULT_LANGUAGE = "en"
 
 
 @dataclass
@@ -101,6 +112,8 @@ class WhisperClient:
         video_path: str,
         model: str | None = None,
         max_retries: int = 3,
+        language: str | None = DEFAULT_LANGUAGE,
+        prompt: str | None = DEFAULT_PROMPT,
     ) -> TranscriptionResult:
         """Transcribe video and return word-level timestamps.
 
@@ -108,6 +121,10 @@ class WhisperClient:
             video_path: Path to video file
             model: Whisper model to use (default: provider-specific)
             max_retries: Max retry attempts for transient API failures
+            language: ISO-639-1 code (default 'en'); skips language detection and
+                cuts mis-heard words. Pass None to let Whisper auto-detect.
+            prompt: vocabulary/style priming hint (default: channel jargon). Pass
+                None or "" to disable.
 
         Returns:
             TranscriptionResult with text, word timestamps, and duration
@@ -115,7 +132,7 @@ class WhisperClient:
         model = model or self.default_model
         audio_path = self._extract_audio(video_path)
         try:
-            return self._transcribe_with_retry(audio_path, model, max_retries)
+            return self._transcribe_with_retry(audio_path, model, max_retries, language, prompt)
         finally:
             os.unlink(audio_path)
 
@@ -124,9 +141,17 @@ class WhisperClient:
         audio_path: str,
         model: str,
         max_retries: int,
+        language: str | None = DEFAULT_LANGUAGE,
+        prompt: str | None = DEFAULT_PROMPT,
     ) -> TranscriptionResult:
         """Call Whisper API with exponential backoff on transient failures."""
         last_error = None
+        # Only send optional params when set, so callers can opt out cleanly.
+        extra = {}
+        if language:
+            extra["language"] = language
+        if prompt:
+            extra["prompt"] = prompt
 
         for attempt in range(max_retries + 1):
             try:
@@ -136,6 +161,7 @@ class WhisperClient:
                         file=audio_file,
                         response_format="verbose_json",
                         timestamp_granularities=["word"],
+                        **extra,
                     )
 
                 words = [

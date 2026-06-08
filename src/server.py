@@ -115,6 +115,14 @@ Returns: Full text, word-level timestamps [{{word, start, end}}], and duration."
                         "type": "boolean",
                         "description": "Force re-transcription even if cache exists (default: false)",
                         "default": False
+                    },
+                    "language": {
+                        "type": "string",
+                        "description": "ISO-639-1 language code (default 'en'). Reduces mis-heard words by skipping detection. Pass empty string to auto-detect."
+                    },
+                    "prompt": {
+                        "type": "string",
+                        "description": "Vocabulary/style priming hint (default: channel jargon). Improves spelling of domain terms. Pass empty string to disable."
                     }
                 },
                 "required": ["video_path"]
@@ -176,6 +184,11 @@ async def call_tool(name: str, arguments: dict):
         video_path = os.path.abspath(arguments["video_path"])
         model = arguments.get("model")
         force = arguments.get("force_retranscribe", False)
+        # Defaults live in the client (DEFAULT_LANGUAGE/DEFAULT_PROMPT). Only override
+        # when the caller actually supplied the key — an explicit "" means opt-out.
+        from client import DEFAULT_LANGUAGE, DEFAULT_PROMPT
+        language = arguments["language"] if "language" in arguments else DEFAULT_LANGUAGE
+        prompt = arguments["prompt"] if "prompt" in arguments else DEFAULT_PROMPT
 
         if not os.path.exists(video_path):
             return [TextContent(type="text", text=f"Error: Video not found: {video_path}")]
@@ -196,7 +209,7 @@ async def call_tool(name: str, arguments: dict):
 
         try:
             client = WhisperClient()
-            result = client.transcribe_video(video_path, model=model)
+            result = client.transcribe_video(video_path, model=model, language=language, prompt=prompt)
             save_transcription_cache(result.words, cache_path)
 
             return [TextContent(type="text", text=json.dumps({
@@ -204,6 +217,7 @@ async def call_tool(name: str, arguments: dict):
                 "source": "whisper_api",
                 "provider": client.provider,
                 "model": model or client.default_model,
+                "language": language or "auto",
                 "cache_path": cache_path,
                 "text": result.text,
                 "duration": result.duration,

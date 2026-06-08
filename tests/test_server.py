@@ -176,9 +176,9 @@ class TestEstimateCostTool:
 
         data = json.loads(result[0].text)
         assert data["provider"] == "groq"
-        assert data["model"] == "whisper-large-v3-turbo"
-        assert data["rate_per_hour"] == 0.04
-        assert data["estimated_cost_usd"] == round((600 / 3600) * 0.04, 4)
+        assert data["model"] == "whisper-large-v3"
+        assert data["rate_per_hour"] == 0.111
+        assert data["estimated_cost_usd"] == round((600 / 3600) * 0.111, 4)
 
 
 # ============================================================

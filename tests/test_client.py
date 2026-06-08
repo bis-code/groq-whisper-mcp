@@ -74,7 +74,7 @@ class TestWhisperClientInit:
             base_url="https://api.groq.com/openai/v1",
         )
         assert client.provider == "groq"
-        assert client.default_model == "whisper-large-v3-turbo"
+        assert client.default_model == "whisper-large-v3"
 
     @patch.dict(os.environ, {"OPENAI_API_KEY": "env-key-456"}, clear=True)
     @patch("client.OpenAI")
@@ -258,7 +258,7 @@ class TestTranscription:
 
     @patch("client.OpenAI")
     def test_transcribe_groq_default_model(self, mock_openai_cls):
-        """Groq provider uses whisper-large-v3-turbo by default"""
+        """Groq provider uses whisper-large-v3 by default"""
         mock_client = MagicMock()
         mock_openai_cls.return_value = mock_client
 
@@ -276,7 +276,29 @@ class TestTranscription:
                     client.transcribe_video("/fake/video.mp4")
 
         call_kwargs = mock_client.audio.transcriptions.create.call_args
-        assert call_kwargs.kwargs.get("model") == "whisper-large-v3-turbo"
+        assert call_kwargs.kwargs.get("model") == "whisper-large-v3"
+        # new defaults: language + vocab prompt are now sent
+        assert call_kwargs.kwargs.get("language") == "en"
+        assert "prompt" in call_kwargs.kwargs
+
+    @patch("client.OpenAI")
+    def test_transcribe_optout_language_and_prompt(self, mock_openai_cls):
+        """Passing empty language/prompt omits them (auto-detect, no priming)."""
+        mock_client = MagicMock()
+        mock_openai_cls.return_value = mock_client
+        mock_response = MagicMock()
+        mock_response.text = "test"; mock_response.words = []; mock_response.duration = 1.0
+        mock_client.audio.transcriptions.create.return_value = mock_response
+
+        client = WhisperClient(api_key="test", provider="groq")
+        with patch.object(client, "_extract_audio", return_value="/tmp/audio.mp3"):
+            with patch("builtins.open", mock_open(read_data=b"audio")):
+                with patch("client.os.unlink"):
+                    client.transcribe_video("/fake/video.mp4", language="", prompt="")
+
+        kwargs = mock_client.audio.transcriptions.create.call_args.kwargs
+        assert "language" not in kwargs
+        assert "prompt" not in kwargs
 
     @patch("client.OpenAI")
     def test_transcribe_custom_model(self, mock_openai_cls):
